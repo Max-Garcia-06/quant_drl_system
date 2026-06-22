@@ -264,7 +264,7 @@ class LiveTrader:
         bars = await self.ib.reqHistoricalDataAsync(
             self.contract,
             endDateTime="",
-            durationStr=f"{self.WARMUP_BARS + 10} B",
+            durationStr="2 D",          # 2 days >> 200 bars; we slice the tail below
             barSizeSetting="1 min",
             whatToShow="MIDPOINT",
             useRTH=False,

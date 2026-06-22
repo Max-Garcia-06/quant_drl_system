@@ -87,7 +87,7 @@ class IBDataClient:
             )
 
         df = self._bars_to_dataframe(bars)
-        logger.info("Fetched %d bars (%s → %s)", len(df), df["date"].iloc[0], df["date"].iloc[-1])
+        logger.info("Fetched %d bars (%s → %s)", len(df), df.index[0], df.index[-1])
         return df
 
     # ------------------------------------------------------------------
