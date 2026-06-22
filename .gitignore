@@ -1,0 +1,20 @@
+# Python
+venv/
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+
+# macOS
+.DS_Store
+
+# Model binaries & checkpoints (large; track with DVC or similar)
+models/saved/
+models/tensorboard/
+
+# Raw data (regenerated from IB or synthetic)
+data/raw/
+
+# IDE
+.vscode/
+.idea/
