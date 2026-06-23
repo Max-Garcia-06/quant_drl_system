@@ -53,7 +53,37 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-MODEL_PATH = ROOT / "models" / "saved" / "ppo_eurusd_best"   # prefer best by val Sharpe
+MODEL_PATH  = ROOT / "models" / "saved" / "ppo_eurusd_best"   # single-model fallback
+MODEL_DIR   = ROOT / "models" / "saved"
+
+
+class EnsembleModel:
+    """Averages actions from N independently-trained PPO members."""
+
+    def __init__(self, models: list) -> None:
+        self.models = models
+
+    def predict(self, obs: np.ndarray, deterministic: bool = True):
+        actions = [m.predict(obs, deterministic=deterministic)[0] for m in self.models]
+        return np.mean(actions, axis=0), None
+
+
+def _load_model(model_path: Path) -> EnsembleModel | PPO:
+    """Load ensemble if members exist, otherwise load single model."""
+    ensemble_paths = sorted(MODEL_DIR.glob("ppo_eurusd_ensemble_*_best.zip"))
+    if ensemble_paths:
+        members = [PPO.load(str(p)) for p in ensemble_paths]
+        logger.info("Loaded ensemble of %d members: %s",
+                    len(members), [p.name for p in ensemble_paths])
+        return EnsembleModel(members)
+
+    mp = Path(str(model_path) + ".zip")
+    if not mp.exists():
+        alt = MODEL_DIR / "ppo_eurusd_final"
+        logger.warning("%s not found — falling back to %s", mp, alt)
+        model_path = alt
+    logger.info("Loading single model: %s", model_path)
+    return PPO.load(str(model_path))
 
 
 class RegimeGuard:
@@ -130,14 +160,7 @@ class LiveTrader:
         self.capital     = capital
         self.whatif_only = whatif_only
 
-        # Try best model first, fall back to final
-        mp = Path(str(model_path) + ".zip")
-        if not mp.exists():
-            alt = ROOT / "models" / "saved" / "ppo_eurusd_final"
-            logger.warning("%s not found — falling back to %s", mp, alt)
-            model_path = alt
-        logger.info("Loading PPO model: %s", model_path)
-        self.model = PPO.load(str(model_path))
+        self.model = _load_model(model_path)
 
         self.ib       = IB()
         self.contract = Forex("EURUSD")

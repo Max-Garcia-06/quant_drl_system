@@ -77,15 +77,37 @@ def load_val_data(val_frac: float = 0.20) -> pd.DataFrame:
     return val_df
 
 
-def load_model(which: str = "best") -> PPO:
-    """Load 'best' (by val Sharpe) or 'final' model."""
+class EnsembleModel:
+    """Wraps N PPO models; returns mean action across all members."""
+
+    def __init__(self, models: list[PPO]) -> None:
+        self.models = models
+
+    def predict(self, obs: np.ndarray, deterministic: bool = True):
+        actions = [m.predict(obs, deterministic=deterministic)[0] for m in self.models]
+        return np.mean(actions, axis=0), None
+
+
+def load_model(which: str = "best") -> PPO | EnsembleModel:
+    """Load 'best', 'final', or 'ensemble' (averages all ensemble members)."""
+    if which == "ensemble":
+        paths = sorted(MODEL_DIR.glob("ppo_eurusd_ensemble_*_best.zip"))
+        if not paths:
+            raise FileNotFoundError(
+                f"No ensemble members found in {MODEL_DIR}. "
+                "Run: venv/bin/python models/train.py --ensemble"
+            )
+        models = [PPO.load(str(p)) for p in paths]
+        logger.info("Loaded ensemble of %d models: %s", len(models),
+                    [p.name for p in paths])
+        return EnsembleModel(models)
+
     candidates = {
         "best":  MODEL_DIR / "ppo_eurusd_best.zip",
         "final": MODEL_DIR / "ppo_eurusd_final.zip",
     }
     path = candidates.get(which, MODEL_DIR / f"{which}.zip")
     if not path.exists():
-        # Fall back to the other one
         alt = candidates["final"] if which == "best" else candidates["best"]
         logger.warning("%s not found, falling back to %s", path, alt)
         path = alt
@@ -206,7 +228,7 @@ def evaluate(which: str = "best", val_frac: float = 0.20) -> dict:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model",    default="best",
-                        help="'best', 'final', or path stem")
+                        help="'best', 'final', 'ensemble', or path stem")
     parser.add_argument("--val-frac", type=float, default=0.20,
                         help="Fraction of data used as validation (default 0.20)")
     args = parser.parse_args()

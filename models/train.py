@@ -96,12 +96,14 @@ class ValidationSharpeCallback(BaseCallback):
         val_df: pd.DataFrame,
         eval_freq: int = 100_000,
         save_path: Path = MODEL_DIR,
+        save_name: str = "ppo_eurusd_best",
         verbose: int = 1,
     ) -> None:
         super().__init__(verbose)
         self._val_env    = TradingEnv(val_df)
         self.eval_freq   = eval_freq
         self.save_path   = save_path
+        self.save_name   = save_name
         self._best_sharpe: float = -np.inf
 
     def _on_step(self) -> bool:
@@ -134,7 +136,7 @@ class ValidationSharpeCallback(BaseCallback):
 
         if sharpe > self._best_sharpe:
             self._best_sharpe = sharpe
-            best_path = self.save_path / "ppo_eurusd_best"
+            best_path = self.save_path / self.save_name
             self.model.save(str(best_path))
             if self.verbose:
                 logger.info("  ↳ New best val Sharpe — model saved → %s.zip", best_path)
@@ -280,9 +282,61 @@ def train(total_timesteps: int = 2_000_000) -> Path:
     return final_path
 
 
+def train_ensemble(
+    n_models: int = 3,
+    total_timesteps: int = 2_000_000,
+    seeds: list[int] | None = None,
+) -> list[Path]:
+    """Train n_models PPO agents with different seeds; save best of each."""
+    if seeds is None:
+        seeds = list(range(n_models))
+
+    df = load_data()
+    logger.info("Total bars: %d", len(df))
+    train_df, val_df = split_data(df)
+
+    paths = []
+    for i, seed in enumerate(seeds):
+        logger.info("=== Ensemble member %d/%d (seed=%d) ===", i + 1, n_models, seed)
+        vec_env = DummyVecEnv([make_env(train_df)])
+        model   = build_model(vec_env)
+        model.set_random_seed(seed)
+
+        save_name = f"ppo_eurusd_ensemble_{i}_best"
+        callbacks = [
+            SharpePnLCallback(rolling_window=500),
+            ValidationSharpeCallback(
+                val_df=val_df,
+                eval_freq=100_000,
+                save_path=MODEL_DIR,
+                save_name=save_name,
+                verbose=1,
+            ),
+        ]
+        model.learn(
+            total_timesteps=total_timesteps,
+            callback=callbacks,
+            tb_log_name=f"ppo_eurusd_ensemble_{i}",
+            progress_bar=True,
+            reset_num_timesteps=True,
+        )
+        paths.append(MODEL_DIR / save_name)
+        logger.info("Ensemble member %d done → %s.zip", i, save_name)
+
+    logger.info("Ensemble training complete. Members: %s", [str(p) for p in paths])
+    return paths
+
+
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--timesteps", type=int, default=2_000_000)
+    parser.add_argument("--ensemble",  action="store_true",
+                        help="Train 3 models with different seeds")
+    parser.add_argument("--n-models",  type=int, default=3)
     args = parser.parse_args()
-    train(total_timesteps=args.timesteps)
+
+    if args.ensemble:
+        train_ensemble(n_models=args.n_models, total_timesteps=args.timesteps)
+    else:
+        train(total_timesteps=args.timesteps)
