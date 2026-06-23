@@ -188,6 +188,10 @@ class LiveTrader:
     def run(self) -> None:
         asyncio.run(self._run_async())
 
+    def close_position(self) -> None:
+        """Standalone: connect to TWS, close open position, disconnect."""
+        asyncio.run(self._run_close_async())
+
     def dry_run(self, n_bars: int = 700) -> None:
         """Test the full inference pipeline without connecting to TWS."""
         logger.info("=== DRY RUN ===")
@@ -248,9 +252,26 @@ class LiveTrader:
             logger.info("Live trader running (%s). Ctrl+C to stop.", mode)
             await asyncio.sleep(float("inf"))
         except (KeyboardInterrupt, asyncio.CancelledError):
-            logger.info("Shutdown requested.")
+            logger.info("Shutdown requested — flattening position...")
+            if not self.whatif_only:
+                await self._close_position()
+            else:
+                logger.info("WhatIf-only mode — no real positions to close.")
         finally:
             await self._disconnect()
+
+    async def _run_close_async(self) -> None:
+        """Connect, sync, close open position, then disconnect. No trading loop."""
+        try:
+            await self.ib.connectAsync(self.TWS_HOST, self.TWS_PORT, clientId=self.CLIENT_ID)
+            await self.ib.qualifyContractsAsync(self.contract)
+            logger.info("Connected to TWS for position close.")
+            await self._sync_position()
+            await self._close_position()
+        finally:
+            if self.ib.isConnected():
+                self.ib.disconnect()
+            logger.info("Disconnected.")
 
     async def _connect(self) -> None:
         await self.ib.connectAsync(self.TWS_HOST, self.TWS_PORT, clientId=self.CLIENT_ID)
@@ -306,6 +327,39 @@ class LiveTrader:
                             self._current_units, self._current_action)
                 return
         logger.info("No existing EUR.USD position — starting flat.")
+
+    async def _close_position(self) -> None:
+        """Flatten any open EUR.USD position and wait up to 30s for fill."""
+        # Re-query actual IB position — local tracking may drift from fills
+        await self._sync_position()
+
+        if abs(self._current_units) < self.MIN_ORDER_UNITS:
+            logger.info(
+                "Position already flat (%.0f EUR) — nothing to close.",
+                self._current_units,
+            )
+            return
+
+        side  = "SELL" if self._current_units > 0 else "BUY"
+        qty   = abs(round(self._current_units))
+        order = MarketOrder(action=side, totalQuantity=qty, tif="DAY")
+        logger.info("CLOSING POSITION: %s %.0f EUR...", side, qty)
+
+        trade = self.ib.placeOrder(self.contract, order)
+        for _ in range(30):
+            await asyncio.sleep(1.0)
+            if trade.orderStatus.status == "Filled":
+                logger.info(
+                    "Position closed | filled=%.0f @ %.5f",
+                    trade.orderStatus.filled,
+                    trade.orderStatus.avgFillPrice,
+                )
+                self._current_units = 0.0
+                return
+        logger.warning(
+            "Close order not confirmed filled within 30s — "
+            "check TWS manually. orderId=%d", trade.order.orderId,
+        )
 
     # -----------------------------------------------------------------------
     # RT bar accumulation → 1-minute candle
@@ -467,6 +521,8 @@ if __name__ == "__main__":
     parser.add_argument("--live",    action="store_true",
                         help="Send real orders — DANGEROUS, paper account only")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--close",   action="store_true",
+                        help="Close open position and exit (no trading loop)")
     args = parser.parse_args()
 
     trader = LiveTrader(
@@ -475,7 +531,9 @@ if __name__ == "__main__":
         whatif_only=not args.live,
     )
 
-    if args.dry_run:
+    if args.close:
+        trader.close_position()
+    elif args.dry_run:
         trader.dry_run()
     else:
         trader.run()
