@@ -56,6 +56,53 @@ logger = logging.getLogger(__name__)
 MODEL_PATH = ROOT / "models" / "saved" / "ppo_eurusd_best"   # prefer best by val Sharpe
 
 
+class RegimeGuard:
+    """
+    Scales down position size when ATR diverges from warm-up baseline.
+
+    During warm-up, records mean and std of ATR across the historical bars.
+    On each candle, if current ATR exceeds mean + N_SIGMA*std, linearly
+    reduces the risk scalar toward 0 (full reduction at mean + 4*std).
+    """
+
+    N_SIGMA: float = 2.5
+
+    def __init__(self) -> None:
+        self._atr_mean: float = 0.0
+        self._atr_std:  float = 1.0
+        self._calibrated: bool = False
+
+    def calibrate(self, bars: list) -> None:
+        atrs = []
+        for b in bars:
+            h, l, c_prev = b["high"], b["low"], None
+            atrs.append(h - l)
+        arr = np.array(atrs, dtype=np.float64)
+        self._atr_mean = float(arr.mean())
+        self._atr_std  = float(arr.std()) or 1e-8
+        self._calibrated = True
+        logger.info(
+            "RegimeGuard calibrated | ATR mean=%.6f | std=%.6f | threshold=%.6f",
+            self._atr_mean, self._atr_std,
+            self._atr_mean + self.N_SIGMA * self._atr_std,
+        )
+
+    def risk_scalar(self, current_bar: dict) -> float:
+        if not self._calibrated:
+            return 1.0
+        atr_now = current_bar["high"] - current_bar["low"]
+        threshold = self._atr_mean + self.N_SIGMA * self._atr_std
+        if atr_now <= threshold:
+            return 1.0
+        upper = self._atr_mean + 4.0 * self._atr_std
+        scalar = float(np.clip(1.0 - (atr_now - threshold) / (upper - threshold + 1e-8), 0.0, 1.0))
+        logger.warning(
+            "REGIME GUARD | atr=%.6f | threshold=%.6f | scalar=%.3f",
+            atr_now, threshold, scalar,
+        )
+        return scalar
+
+
 class LiveTrader:
     """
     Connects to TWS, subscribes to EUR.USD real-time bars, runs PPO inference
@@ -109,6 +156,7 @@ class LiveTrader:
         self._prev_close: Optional[float] = None
 
         self._rt_bars: Optional[RealTimeBarList] = None
+        self._regime_guard = RegimeGuard()
 
     # -----------------------------------------------------------------------
     # Public API
@@ -219,6 +267,7 @@ class LiveTrader:
             })
         if self._minute_bars:
             self._prev_close = self._minute_bars[-1]["close"]
+        self._regime_guard.calibrate(list(self._minute_bars))
         logger.info("Warm-up: %d bars loaded.", len(self._minute_bars))
 
     async def _sync_position(self) -> None:
@@ -288,8 +337,7 @@ class LiveTrader:
         df["low"]    = df["low"].astype(float)
         df["close"]  = df["close"].astype(float)
         df["volume"] = -1.0   # Forex MIDPOINT has no volume; _build_features ignores it
-        dti = pd.DatetimeIndex(df["datetime"])
-        df.index = dti.tz_localize("UTC") if dti.tz is None else dti.tz_convert("UTC")
+        df.index = pd.to_datetime(df["datetime"], utc=True)
         df = df[["open", "high", "low", "close", "volume"]]
 
         # Replicate TradingEnv feature pipeline exactly
@@ -328,8 +376,9 @@ class LiveTrader:
         action_arr, _ = self.model.predict(state, deterministic=True)
         action = float(np.clip(action_arr.flat[0], -1.0, 1.0))
 
-        max_units   = self.capital / close_price
-        target_units = action * max_units
+        max_units    = self.capital / close_price
+        scalar       = self._regime_guard.risk_scalar(self._minute_bars[-1])
+        target_units = action * max_units * scalar
         delta_units  = round(target_units - self._current_units)
 
         logger.info(
@@ -350,7 +399,7 @@ class LiveTrader:
             return
 
         side  = "BUY" if delta_units > 0 else "SELL"
-        order = MarketOrder(action=side, totalQuantity=abs(delta_units))
+        order = MarketOrder(action=side, totalQuantity=abs(delta_units), tif="DAY")
 
         if self.whatif_only:
             await self._what_if(order)
@@ -361,7 +410,12 @@ class LiveTrader:
 
     async def _what_if(self, order: MarketOrder) -> None:
         try:
-            s = await self.ib.whatIfOrderAsync(self.contract, order)
+            result = await self.ib.whatIfOrderAsync(self.contract, order)
+            if not result:
+                logger.warning("WhatIf %s %d EUR | no response from IB (order preset override)",
+                               order.action, int(order.totalQuantity))
+                return
+            s = result[0] if isinstance(result, list) else result
             logger.info(
                 "WhatIf %s %d EUR | init_margin_Δ=%s | maint_margin_Δ=%s | commission≈%s %s",
                 order.action, int(order.totalQuantity),

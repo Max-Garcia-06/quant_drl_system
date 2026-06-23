@@ -1,18 +1,16 @@
 """
-Gymnasium MDP environment for DRL Forex trading.
+Gymnasium MDP environment for DRL Forex trading — v3
 
-Key upgrades vs v1
+Key upgrades vs v2
 ──────────────────
-  Features      : volume dropped; ATR + hour_sin/cos + dow_sin/cos added
-                  N_BAR_FEATURES: 7 → 11  |  OBS_DIM: 351 → 551
-  Normalisation : global Z-score → causal 500-bar rolling Z-score
-                  (eliminates lookahead bias; adapts to regime shifts)
-  Inference parity : _build_features() and _apply_rolling_norm() are
-                  classmethods imported by the live trader — guarantees
-                  bitwise identical feature computation at inference time.
+  Features      : 11 → 17 features per bar
+                  + ret_60 / ret_240 / ret_480  (multi-timeframe momentum)
+                  + bbw / vol_ratio / trend_str  (regime indicators)
+  Window        : WINDOW_SIZE 50 → 100 bars (captures intraday trends)
+  OBS_DIM       : 551 → 1701  (100 bars × 17 features + 1 upnl scalar)
 
-Observation (float32, shape (551,)):
-    Rolling window of 50 bars × 11 Z-score-normalised features, plus a
+Observation (float32, shape (1701,)):
+    Rolling window of 100 bars × 17 Z-score-normalised features, plus a
     tanh-bounded unrealised-PnL scalar.
 
 Action (float32, shape (1,)):
@@ -35,24 +33,33 @@ from gymnasium import spaces
 class TradingEnv(gym.Env):
     metadata = {"render_modes": []}
 
-    WINDOW_SIZE: int = 50
-    NORM_WINDOW: int = 500      # rolling Z-score lookback
+    WINDOW_SIZE: int = 100          # bars in each observation window
+    NORM_WINDOW: int = 500          # rolling Z-score lookback
 
     MACD_FAST: int   = 12
     MACD_SLOW: int   = 26
     MACD_SIGNAL: int = 9
     RSI_PERIOD: int  = 14
     ATR_PERIOD: int  = 14
+    BB_PERIOD: int   = 20           # Bollinger Band / vol-ratio short window
+    VR_LONG: int     = 100          # vol-ratio long window
+    ADX_PERIOD: int  = 14           # trend strength smoothing
 
-    # [open, high, low, close, macd_hist, rsi, atr, hour_sin, hour_cos, dow_sin, dow_cos]
     FEAT_COLS: List[str] = [
+        # price
         "open", "high", "low", "close",
+        # classic indicators
         "macd_hist", "rsi", "atr",
+        # time
         "hour_sin", "hour_cos", "dow_sin", "dow_cos",
+        # multi-timeframe momentum (catches intraday trends)
+        "ret_60", "ret_240", "ret_480",
+        # regime indicators
+        "bbw", "vol_ratio", "trend_str",
     ]
-    N_BAR_FEATURES: int = len(FEAT_COLS)   # 11
+    N_BAR_FEATURES: int = len(FEAT_COLS)   # 17
 
-    # 50 bars × 11 features + 1 unrealised-PnL scalar = 551
+    # 100 bars × 17 features + 1 unrealised-PnL scalar = 1701
     OBS_DIM: int = WINDOW_SIZE * N_BAR_FEATURES + 1
 
     TRANSACTION_COST: float = 0.0001
@@ -212,6 +219,37 @@ class TradingEnv(gym.Env):
         out["hour_cos"] = np.cos(2 * np.pi * hour / 24.0)
         out["dow_sin"]  = np.sin(2 * np.pi * dow  / 5.0)
         out["dow_cos"]  = np.cos(2 * np.pi * dow  / 5.0)
+
+        # ── Multi-timeframe momentum ──────────────────────────────────
+        # Causal pct_change over N bars — captures 1h / 4h / 8h trends
+        out["ret_60"]  = out["close"].pct_change(60).fillna(0.0)
+        out["ret_240"] = out["close"].pct_change(240).fillna(0.0)
+        out["ret_480"] = out["close"].pct_change(480).fillna(0.0)
+
+        # ── Regime indicators ─────────────────────────────────────────
+        # Bollinger Band Width: spikes on volatility regime shifts
+        roll_mean = out["close"].rolling(cls.BB_PERIOD, min_periods=5).mean()
+        roll_std  = out["close"].rolling(cls.BB_PERIOD, min_periods=5).std().clip(lower=1e-8)
+        out["bbw"] = (4.0 * roll_std / roll_mean.clip(lower=1e-8)).fillna(0.0)
+
+        # Volatility Ratio: short-term vol / long-term vol
+        ret_1bar  = out["close"].pct_change()
+        rv_short  = ret_1bar.rolling(cls.BB_PERIOD, min_periods=5).std().clip(lower=1e-8)
+        rv_long   = ret_1bar.rolling(cls.VR_LONG, min_periods=20).std().clip(lower=1e-8)
+        out["vol_ratio"] = (rv_short / rv_long).fillna(1.0)
+
+        # Trend Strength (ADX proxy): directional move relative to ATR
+        up_move   = (out["high"] - out["high"].shift(1)).clip(lower=0.0)
+        down_move = (out["low"].shift(1) - out["low"]).clip(lower=0.0)
+        plus_dm   = pd.Series(
+            np.where(up_move > down_move, up_move, 0.0), index=out.index
+        ).ewm(span=cls.ADX_PERIOD, adjust=False).mean()
+        minus_dm  = pd.Series(
+            np.where(down_move > up_move, down_move, 0.0), index=out.index
+        ).ewm(span=cls.ADX_PERIOD, adjust=False).mean()
+        out["trend_str"] = (
+            (plus_dm - minus_dm).abs() / out["atr"].clip(lower=1e-8)
+        ).fillna(0.0)
 
         out = out.dropna()
         return out[cls.FEAT_COLS]
