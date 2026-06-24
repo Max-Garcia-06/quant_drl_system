@@ -277,6 +277,7 @@ class LiveTrader:
         await self.ib.connectAsync(self.TWS_HOST, self.TWS_PORT, clientId=self.CLIENT_ID)
         await self.ib.qualifyContractsAsync(self.contract)
         logger.info("Contract qualified: %s", self.contract)
+        self.ib.positionEvent += self._on_position_event
         await self._warm_up()
         await self._sync_position()
         self._rt_bars = self.ib.reqRealTimeBars(
@@ -313,6 +314,18 @@ class LiveTrader:
             self._prev_close = self._minute_bars[-1]["close"]
         self._regime_guard.calibrate(list(self._minute_bars))
         logger.info("Warm-up: %d bars loaded.", len(self._minute_bars))
+
+    def _on_position_event(self, position) -> None:
+        """Update _current_units from IB's confirmed position after every fill."""
+        c = position.contract
+        if getattr(c, "symbol", "") == "EUR" and getattr(c, "secType", "") == "CASH":
+            prev = self._current_units
+            self._current_units = float(position.position)
+            if abs(self._current_units - prev) > 1:
+                logger.info(
+                    "Position update from IB: %+.0f → %+.0f EUR",
+                    prev, self._current_units,
+                )
 
     async def _sync_position(self) -> None:
         for pos in self.ib.positions():
