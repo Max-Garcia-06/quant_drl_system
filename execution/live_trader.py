@@ -133,6 +133,58 @@ class RegimeGuard:
         return scalar
 
 
+class DrawdownGuard:
+    """
+    Halts trading when peak-to-trough session drawdown exceeds max_drawdown.
+    Auto-resumes after cooldown_hours without manual intervention.
+    """
+
+    def __init__(self, max_drawdown: float = 0.03, cooldown_hours: float = 2.0) -> None:
+        self._max_drawdown   = max_drawdown
+        self._cooldown_secs  = cooldown_hours * 3600
+        self._peak_equity:   float = 0.0
+        self._halted_until:  Optional[datetime] = None
+        self._initialized:   bool = False
+
+    def update(self, equity: float) -> bool:
+        """Update peak, check drawdown. Returns True only on halt transition."""
+        if not self._initialized:
+            self._peak_equity = equity
+            self._initialized = True
+
+        if self.is_halted():
+            return False
+
+        if equity > self._peak_equity:
+            self._peak_equity = equity
+
+        drawdown = (self._peak_equity - equity) / (self._peak_equity + 1e-12)
+        if drawdown > self._max_drawdown:
+            from datetime import timedelta
+            self._halted_until = datetime.now(tz=timezone.utc) + timedelta(
+                seconds=self._cooldown_secs
+            )
+            logger.warning(
+                "DRAWDOWN HALT | drawdown=%.2f%% > %.0f%% threshold | "
+                "peak=%.2f | current=%.2f | resuming at %s",
+                drawdown * 100, self._max_drawdown * 100,
+                self._peak_equity, equity,
+                self._halted_until.strftime("%H:%M:%S UTC"),
+            )
+            return True
+
+        return False
+
+    def is_halted(self) -> bool:
+        if self._halted_until is None:
+            return False
+        if datetime.now(tz=timezone.utc) >= self._halted_until:
+            logger.info("DRAWDOWN GUARD | cooldown expired — resuming trading.")
+            self._halted_until = None
+            return False
+        return True
+
+
 class LiveTrader:
     """
     Connects to TWS, subscribes to EUR.USD real-time bars, runs PPO inference
@@ -179,7 +231,8 @@ class LiveTrader:
         self._prev_close: Optional[float] = None
 
         self._rt_bars: Optional[RealTimeBarList] = None
-        self._regime_guard = RegimeGuard()
+        self._regime_guard    = RegimeGuard()
+        self._drawdown_guard  = DrawdownGuard(max_drawdown=0.03, cooldown_hours=2.0)
 
     # -----------------------------------------------------------------------
     # Public API
@@ -456,6 +509,19 @@ class LiveTrader:
             ret = (close_price - self._prev_close) / self._prev_close
             self._unrealised_pnl += self._current_action * ret
         self._prev_close = close_price
+
+        equity = self.capital + self._unrealised_pnl * self.capital
+        halt_triggered = self._drawdown_guard.update(equity)
+        if halt_triggered:
+            if not self.whatif_only:
+                await self._close_position()
+            else:
+                logger.info("WhatIf-only mode — no real positions to close on halt.")
+            return
+
+        if self._drawdown_guard.is_halted():
+            logger.info("DRAWDOWN GUARD | halted — bars accumulating, inference suspended.")
+            return
 
         state = self._build_state()
         if state is None:
