@@ -203,6 +203,12 @@ class LiveTrader:
 
     MIN_ORDER_UNITS: int = 1_000   # IB IDEALPRO minimum EUR lot
 
+    # Volatility targeting — scale position so portfolio vol ≈ VOL_TARGET per bar
+    # 0.0002/bar ≈ 12% annualised (1-min, factor √(252×24×60)≈602)
+    # Only reduces position when realized vol exceeds target (scalar ≤ 1.0)
+    VOL_TARGET:   float = 0.0002
+    VOL_LOOKBACK: int   = 60      # bars (~1 hour of 1-min data)
+
     def __init__(
         self,
         model_path: Path = MODEL_PATH,
@@ -534,6 +540,24 @@ class LiveTrader:
     # Inference + order execution
     # -----------------------------------------------------------------------
 
+    def _vol_target_scalar(self) -> float:
+        """Returns min(1, VOL_TARGET / realized_vol) using last VOL_LOOKBACK bars."""
+        buf = list(self._minute_bars)
+        if len(buf) < self.VOL_LOOKBACK + 1:
+            return 1.0
+        closes = np.array([b["close"] for b in buf[-(self.VOL_LOOKBACK + 1):]], dtype=np.float64)
+        returns = np.diff(closes) / (closes[:-1] + 1e-12)
+        realized_vol = float(np.std(returns))
+        if realized_vol < 1e-10:
+            return 1.0
+        scalar = min(1.0, self.VOL_TARGET / realized_vol)
+        if scalar < 1.0:
+            logger.info(
+                "VOL TARGET | realized=%.6f | target=%.6f | scalar=%.3f",
+                realized_vol, self.VOL_TARGET, scalar,
+            )
+        return scalar
+
     async def _rebalance(self, close_price: float) -> None:
         # Update PnL from the position held during the closed candle
         if self._prev_close and self._prev_close > 0:
@@ -565,13 +589,14 @@ class LiveTrader:
 
         max_units    = self.capital / close_price
         scalar       = self._regime_guard.risk_scalar(self._minute_bars[-1])
-        target_units = action * max_units * scalar
+        vol_scalar   = self._vol_target_scalar()
+        target_units = action * max_units * scalar * vol_scalar
         delta_units  = round(target_units - self._current_units)
 
         logger.info(
-            "Candle close | price=%.5f | action=%+.4f | "
+            "Candle close | price=%.5f | action=%+.4f | vol_s=%.3f | "
             "target=%+.1f EUR | current=%+.1f EUR | Δ=%+d EUR | upnl=%+.6f",
-            close_price, action, target_units,
+            close_price, action, vol_scalar, target_units,
             self._current_units, delta_units, self._unrealised_pnl,
         )
 
