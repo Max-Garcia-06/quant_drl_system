@@ -209,6 +209,10 @@ class LiveTrader:
     VOL_TARGET:   float = 0.0002
     VOL_LOOKBACK: int   = 60      # bars (~1 hour of 1-min data)
 
+    # Minimum rebalance size — skip orders smaller than this fraction of max
+    # position to reduce churn and odd-lot fills (0.5% ≈ 4,400 EUR at $1M capital)
+    MIN_REBALANCE_FRAC: float = 0.005
+
     def __init__(
         self,
         model_path: Path = MODEL_PATH,
@@ -604,9 +608,13 @@ class LiveTrader:
             self._current_action = action
             return
 
-        if abs(delta_units) < self.MIN_ORDER_UNITS:
-            logger.warning("|Δ|=%d EUR < IB min %d EUR — skipped.",
-                           abs(delta_units), self.MIN_ORDER_UNITS)
+        min_rebalance = max(
+            self.MIN_ORDER_UNITS,
+            round(max_units * self.MIN_REBALANCE_FRAC),
+        )
+        if abs(delta_units) < min_rebalance:
+            logger.debug("|Δ|=%d EUR < min rebalance %d EUR — skipped.",
+                         abs(delta_units), min_rebalance)
             self._current_action = action
             return
 
