@@ -231,6 +231,7 @@ class LiveTrader:
         self._prev_close: Optional[float] = None
 
         self._rt_bars: Optional[RealTimeBarList] = None
+        self._last_bar_time: Optional[datetime] = None
         self._regime_guard    = RegimeGuard()
         self._drawdown_guard  = DrawdownGuard(max_drawdown=0.03, cooldown_hours=2.0)
 
@@ -299,19 +300,44 @@ class LiveTrader:
     # -----------------------------------------------------------------------
 
     async def _run_async(self) -> None:
-        try:
-            await self._connect()
-            mode = "WHATIF-ONLY" if self.whatif_only else "LIVE ORDERS"
-            logger.info("Live trader running (%s). Ctrl+C to stop.", mode)
-            await asyncio.sleep(float("inf"))
-        except (KeyboardInterrupt, asyncio.CancelledError):
-            logger.info("Shutdown requested — flattening position...")
-            if not self.whatif_only:
-                await self._close_position()
-            else:
-                logger.info("WhatIf-only mode — no real positions to close.")
-        finally:
+        _BACKOFF = [30, 60, 120, 300]   # seconds between reconnect attempts
+        attempt  = 0
+        while True:
+            try:
+                await self._connect()
+                mode = "WHATIF-ONLY" if self.whatif_only else "LIVE ORDERS"
+                logger.info("Live trader running (%s). Ctrl+C to stop.", mode)
+                attempt = 0
+                await self._watch_connection()
+            except (KeyboardInterrupt, asyncio.CancelledError):
+                logger.info("Shutdown requested — flattening position...")
+                if not self.whatif_only:
+                    await self._close_position()
+                else:
+                    logger.info("WhatIf-only mode — no real positions to close.")
+                await self._disconnect()
+                return
+            except Exception as exc:
+                logger.warning("Connection lost: %s — will reconnect.", exc)
+
             await self._disconnect()
+            wait = _BACKOFF[min(attempt, len(_BACKOFF) - 1)]
+            attempt += 1
+            logger.info("Reconnecting in %ds (attempt %d)...", wait, attempt)
+            await asyncio.sleep(wait)
+
+    async def _watch_connection(self) -> None:
+        """Poll every 60s; raise ConnectionError if no RT bar for 20 minutes."""
+        STALE_SECS = 20 * 60
+        while True:
+            await asyncio.sleep(60)
+            if self._last_bar_time is None:
+                continue
+            age = (datetime.now(tz=timezone.utc) - self._last_bar_time).total_seconds()
+            if age > STALE_SECS:
+                raise ConnectionError(
+                    f"No RT bars for {age / 60:.0f} min — connection presumed dead."
+                )
 
     async def _run_close_async(self) -> None:
         """Connect, sync, close open position, then disconnect. No trading loop."""
@@ -348,6 +374,10 @@ class LiveTrader:
 
     async def _warm_up(self) -> None:
         logger.info("Loading %d historical 1-min bars for warm-up...", self.WARMUP_BARS)
+        self._minute_bars.clear()
+        self._rt_bar_accum  = []
+        self._rt_bar_minute = None
+        self._prev_close    = None
         bars = await self.ib.reqHistoricalDataAsync(
             self.contract, endDateTime="",
             durationStr="2 D",
@@ -434,6 +464,7 @@ class LiveTrader:
     def _on_rt_bar_update(self, bars: RealTimeBarList, hasNewBar: bool) -> None:
         if not hasNewBar:
             return
+        self._last_bar_time = datetime.now(tz=timezone.utc)
         latest    = bars[-1]
         bar_min   = latest.time.replace(second=0, microsecond=0, tzinfo=timezone.utc)
 
